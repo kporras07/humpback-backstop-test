@@ -1,0 +1,259 @@
+version: 2
+jobs:
+  build:
+    docker:
+      - image: kporras07/docker-drupal-nginx:php-7.2.x-backstop
+      - image: selenium/standalone-chrome-debug:3.6.0
+      - image: kporras07/lighthouse-ci:nonheadless
+      - image: mariadb:5.5
+        environment:
+          MYSQL_DATABASE: drupal
+          MYSQL_ROOT_PASSWORD: drupal
+    working_directory: /var/www/backstop
+    steps:
+      - run: apt-get update -y && apt-get install python -y
+      - run: echo 127.0.0.1 backstop.local | tee -a /etc/hosts
+      - checkout
+      - restore_cache:
+          keys:
+            - npm-cache-{{ checksum "package.json" }}
+            - composer-cache-{{ checksum "composer.lock" }}
+      - run: npm install
+      - save_cache:
+         key: npm-cache-{{ checksum "package.json" }}
+         paths:
+           - node_modules
+      - run:
+          name: Install Composer
+          command: |
+            php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && \
+            php -r "copy('https://composer.github.io/installer.sig', 'composer-setup.sig');" && \
+            php -r "if (hash_file('SHA384', 'composer-setup.php') === trim(file_get_contents('composer-setup.sig'))) { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;" && \
+            php composer-setup.php && \
+            php -r "unlink('composer-setup.php');"
+            mv composer.phar /usr/bin/composer
+      - run:
+          name: Configure Nginx
+          command: |
+            cp ./.circleci/backstop /etc/nginx/sites-available/default
+      - run:
+          name: Build site.
+          command: |
+            cp ./.circleci/settings.secret.php ./settings/
+            composer install
+            chmod 777 -R ./web/sites/default/files
+            cd web
+            if [ -f /var/www/backstop/config/sync/core.extension.yml ] ; then echo 'Install with config' ; /usr/bin/env PHP_OPTIONS="-d sendmail_path=`which true`" ../vendor/bin/drush si backstop -y ; ../vendor/bin/drush config-set "system.site" uuid $SITE_UUID -y ; ../vendor/bin/drush cim -y ; else echo 'Install without config' ; /usr/bin/env PHP_OPTIONS="-d sendmail_path=`which true`" ../vendor/bin/drush si backstop -y ; fi
+            cd /var/www/backstop
+      - run:
+          name: Coding Standards Linters
+          command: |
+            ./node_modules/.bin/gulp phplint
+            ./node_modules/.bin/gulp drupalcs
+            ./node_modules/.bin/gulp eslint
+      - run:
+          name: Backstop
+          command: |
+            backstop reference
+            backstop test
+      - store_artifacts:
+          path: ./backstop_data
+          destination: backstop
+      - run:
+          name: Behat Testing
+          command: |
+            /etc/init.d/nginx start > nginx.log &
+            /etc/init.d/php7.2-fpm start > php7.2-fpm.log &
+            ./vendor/bin/behat -p circle
+      - run:
+          name: Lighthouse
+          command: |
+            mkdir /tmp/lighthouse
+            curl -X POST -H "Content-Type: application/json" -H "X-API-KEY: abc123" --data '{"output": "html", "url": "http://backstop.local"}' http://localhost:8080/ci > /tmp/lighthouse/output.html
+      - store_artifacts:
+          path: /tmp/lighthouse
+          destination: lighthouse
+
+  deploy:
+    docker:
+      - image: kporras07/docker-drupal-nginx:php-7.2.x
+    working_directory: /var/www/backstop
+    steps:
+      - checkout
+      - run:
+          name: Install Composer
+          command: |
+            php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && \
+            php -r "copy('https://composer.github.io/installer.sig', 'composer-setup.sig');" && \
+            php -r "if (hash_file('SHA384', 'composer-setup.php') === trim(file_get_contents('composer-setup.sig'))) { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;" && \
+            php composer-setup.php && \
+            php -r "unlink('composer-setup.php');"
+            mv composer.phar /usr/bin/composer
+      - run: composer install
+      - run:
+          name: Install ahoy
+          command: |
+            apt-get update -y && apt-get install wget -y
+            wget -q https://github.com/ahoy-cli/ahoy/releases/download/2.0.0/ahoy-bin-`uname -s`-amd64 -O /usr/local/bin/ahoy && chmod +x /usr/local/bin/ahoy
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            # @TODO: Add ssh_key fingerprint here.
+            - ""
+      - run:
+          name: Deploy
+          command: |
+            # @TODO: Configure git.
+            git config --global user.email ""
+            git config --global user.name ""
+            echo 'Host *' >> /root/.ssh/config
+            echo '   StrictHostKeyChecking no' >> /root/.ssh/config
+            ahoy site deploy master "Auto deploy triggered from master branch"
+      - run:
+          name: Install and login terminus
+          command: |
+            mkdir terminus && cd terminus
+            curl -O https://raw.githubusercontent.com/pantheon-systems/terminus-installer/master/builds/installer.phar && php installer.phar install
+            ln -s /var/www/backstop/terminus/vendor/bin/terminus /usr/bin/terminus
+            terminus auth:login --machine-token=$PANTHEON_TOKEN
+            terminus drush backstop.dev -- si backstop --account-pass=admin -y
+            terminus drush backstop.dev -- config-set "system.site" uuid "$SITE_UUID" -y
+            terminus drush backstop.dev -- cim -y
+            terminus drush backstop.dev -- cr
+  deploy-test:
+    docker:
+      - image: kporras07/docker-drupal-nginx:php-7.2.x
+    working_directory: /var/www/backstop
+    steps:
+      - run:
+          name: Install and login terminus
+          command: |
+            echo 'Host *' >> /root/.ssh/config
+            echo '   StrictHostKeyChecking no' >> /root/.ssh/config
+            mkdir terminus && cd terminus
+            curl -O https://raw.githubusercontent.com/pantheon-systems/terminus-installer/master/builds/installer.phar && php installer.phar install
+            ln -s /var/www/backstop/terminus/vendor/bin/terminus /usr/bin/terminus
+            terminus auth:login --machine-token=$PANTHEON_TOKEN
+            terminus env:deploy backstop.test --note "Autodeploy from Circle" -y
+            terminus drush backstop.test -- updb -y
+            terminus drush backstop.test -- cim -y
+            terminus drush backstop.test -- cr
+  deploy-live:
+    docker:
+      - image: kporras07/docker-drupal-nginx:php-7.2.x
+    working_directory: /var/www/backstop
+    steps:
+      - run:
+          name: Install and login terminus
+          command: |
+            echo 'Host *' >> /root/.ssh/config
+            echo '   StrictHostKeyChecking no' >> /root/.ssh/config
+            mkdir terminus && cd terminus
+            curl -O https://raw.githubusercontent.com/pantheon-systems/terminus-installer/master/builds/installer.phar && php installer.phar install
+            ln -s /var/www/backstop/terminus/vendor/bin/terminus /usr/bin/terminus
+            terminus auth:login --machine-token=$PANTHEON_TOKEN
+            terminus env:deploy backstop.live --note "Autodeploy from Circle" -y
+            terminus drush backstop.live -- updb -y
+            terminus drush backstop.live -- cim -y
+            terminus drush backstop.live -- cr
+
+  deploy-multidev:
+    docker:
+      - image: kporras07/docker-drupal-nginx:php-7.2.x
+    working_directory: /var/www/backstop
+    steps:
+      - checkout
+      - run:
+          name: Install Composer and terminus
+          command: |
+            php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && \
+            php -r "copy('https://composer.github.io/installer.sig', 'composer-setup.sig');" && \
+            php -r "if (hash_file('SHA384', 'composer-setup.php') === trim(file_get_contents('composer-setup.sig'))) { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;" && \
+            php composer-setup.php && \
+            php -r "unlink('composer-setup.php');"
+            mv composer.phar /usr/bin/composer
+            mkdir $HOME/terminus && cd $HOME/terminus
+            curl -O https://raw.githubusercontent.com/pantheon-systems/terminus-installer/master/builds/installer.phar && php installer.phar install
+            ln -s $HOME/terminus/vendor/bin/terminus /usr/bin/terminus
+            terminus auth:login --machine-token=$PANTHEON_TOKEN
+            cd /var/www/backstop
+      - run: composer install
+      - run:
+          name: Install ahoy
+          command: |
+            apt-get update -y && apt-get install wget -y
+            wget -q https://github.com/devinci-code/ahoy/releases/download/2.0.0/ahoy-`uname -s`-amd64 -O /usr/local/bin/ahoy && chmod +x /usr/local/bin/ahoy
+      - add_ssh_keys:
+          fingerprints:
+            # @TODO: Add ssh_key fingerprint here.
+            - ""
+      - run:
+          name: Create multidev environment
+          command: |
+            NEWBRANCH=$CIRCLE_BRANCH
+            LENGTH=${#NEWBRANCH}
+            if [ LENGTH > 10 ] ; then NEWBRANCH=${NEWBRANCH:8:9} ; fi
+            NEWBRANCH=${NEWBRANCH//-/}
+            NEWBRANCH=${NEWBRANCH,,}
+            terminus multidev:create backstop.live $NEWBRANCH || true
+      - run:
+          name: Deploy
+          command: |
+            NEWBRANCH=$CIRCLE_BRANCH
+            LENGTH=${#NEWBRANCH}
+            if [ LENGTH > 10 ] ; then NEWBRANCH=${NEWBRANCH:8:9} ; fi
+            NEWBRANCH=${NEWBRANCH//-/}
+            NEWBRANCH=${NEWBRANCH,,}
+            # @TODO: Configure git.
+            git config --global user.email "change-me@change-me.com"
+            git config --global user.name "Change me"
+            echo 'Host *' >> /root/.ssh/config
+            echo '   StrictHostKeyChecking no' >> /root/.ssh/config
+            ahoy deploy $NEWBRANCH "Auto deploy triggered from master branch"
+      - run:
+          name: Deploy commands
+          command: |
+            NEWBRANCH=$CIRCLE_BRANCH
+            LENGTH=${#NEWBRANCH}
+            if [ LENGTH > 10 ] ; then NEWBRANCH=${NEWBRANCH:8:9} ; fi
+            NEWBRANCH=${NEWBRANCH//-/}
+            NEWBRANCH=${NEWBRANCH,,}
+            terminus drush backstop.$NEWBRANCH -- cr
+            terminus drush backstop.$NEWBRANCH -- sqlsan -y
+            terminus drush backstop.$NEWBRANCH -- updb -y
+            terminus drush backstop.$NEWBRANCH -- cim -y
+            terminus drush backstop.$NEWBRANCH -- cr
+            terminus lock:enable backstop.$NEWBRANCH -- $PANTHEON_WEB_AUTH_USER $PANTHEON_WEB_AUTH_PASS
+            echo "If everything worked, go to http://$NEWBRANCH-backstop.pantheonsite.io"
+workflows:
+  version: 2
+  build-deploys:
+    jobs:
+      - build
+      - deploy:
+          requires:
+            - build
+          filters:
+            branches:
+              only: master
+      - deploy-multidev-hold:
+          type: approval
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - /feature\/.*/
+      - deploy-multidev:
+          requires:
+            - deploy-multidev-hold
+      - deploy-test:
+          requires:
+            - deploy
+      - deploy-live-hold:
+          type: approval
+          requires:
+            - deploy-test
+      - deploy-live:
+          requires:
+            - deploy-live-hold
